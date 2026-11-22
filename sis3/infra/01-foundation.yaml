@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SIS3 - foundation stack (messaging + data + registry).
+  Deploy this FIRST. No ECS/ALB here, so it always deploys cleanly
+  even before any Docker image exists.
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Environment name. Used to namespace resources and exports.
+
+Resources:
+
+  # ---------- Messaging: SQS queue + DLQ (week 9) ----------
+
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "orders-dlq-${Env}"
+      MessageRetentionPeriod: 1209600   # 14 days, the maximum - gives time to notice and replay
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "orders-queue-${Env}"
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: 5
+
+  # ---------- Domain event fan-out: SNS -> SQS (week 9) ----------
+
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "order-events-${Env}"
+
+  OrdersQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt OrdersQueue.Arn
+      RawMessageDelivery: true   # the queue sees the plain JSON, not wrapped in an SNS envelope
+
+  # SNS cannot deliver into a queue it wasn't explicitly allowed to - this is the "every layer gets
+  # a vote" rule from week 2 / week 9, applied to SQS: an identity policy alone is not enough,
+  # the resource (the queue) needs its own policy naming the SNS topic as an allowed sender.
+  OrdersQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref OrdersQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSnsToSend
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrdersQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  # ---------- Idempotency store for the consumer ----------
+  # The consumer Lambda uses this table as its "have I already done this?" memory.
+  # Dedup key = MessageId (we use the order's own orderId, see consumer code below).
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "orders-idempotency-${Env}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: MessageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: MessageId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ExpiresAt
+        Enabled: true
+
+  # ---------- The idempotent consumer (week 9) ----------
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/orders-consumer-${Env}"
+      RetentionInDays: 14
+
+  ConsumerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "orders-consumer-role-${Env}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: consumer-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ConsumerLogGroup.Arn}:*"
+              - Sid: ReadQueue
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt OrdersQueue.Arn
+              - Sid: Idempotency
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem]
+                Resource: !GetAtt IdempotencyTable.Arn
+
+  ConsumerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ConsumerLogGroup
+    Properties:
+      FunctionName: !Sub "orders-consumer-${Env}"
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt ConsumerFunctionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref IdempotencyTable
+      Code:
+        ZipFile: |
+          import json, os, time
+          import boto3
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+
+          def handler(event, context):
+              for record in event["Records"]:
+                  body = json.loads(record["body"])
+                  # the dedup key: the domain's own orderId if present, else SQS's own MessageId
+                  dedup_key = body.get("orderId") or record["messageId"]
+                  try:
+                      table.put_item(
+                          Item={
+                              "MessageId": dedup_key,
+                              "ProcessedAt": int(time.time()),
+                              "ExpiresAt": int(time.time()) + 86400,
+                          },
+                          ConditionExpression="attribute_not_exists(MessageId)",
+                      )
+                  except ClientError as e:
+                      if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                          print(f"DUPLICATE skipped, dedup_key={dedup_key}")
+                          continue
+                      raise
+                  print(f"PROCESSED order, dedup_key={dedup_key}, body={body}")
+              return {"batchItemFailures": []}
+
+  ConsumerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt OrdersQueue.Arn
+      FunctionName: !Ref ConsumerFunction
+      BatchSize: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ---------- Container registry (week 10) ----------
+
+  OrdersRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    Properties:
+      RepositoryName: !Sub "orders-api-${Env}"
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 7 days",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 7 },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only the last 10 tagged images",
+                "selection": { "tagStatus": "tagged", "tagPrefixList": ["v", "sha-"], "countType": "imageCountMoreThan", "countNumber": 10 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+Outputs:
+  QueueArn:
+    Value: !GetAtt OrdersQueue.Arn
+    Export: { Name: !Sub "${Env}-orders-queue-arn" }
+  QueueUrl:
+    Value: !Ref OrdersQueue
+    Export: { Name: !Sub "${Env}-orders-queue-url" }
+  TopicArn:
+    Value: !Ref OrderEventsTopic
+    Export: { Name: !Sub "${Env}-order-events-topic-arn" }
+  EcrRepoName:
+    Value: !Ref OrdersRepo
+    Export: { Name: !Sub "${Env}-orders-repo-name" }
+  EcrRepoArn:
+    Value: !GetAtt OrdersRepo.Arn
+    Export: { Name: !Sub "${Env}-orders-repo-arn" }
+  IdempotencyTableName:
+    Value: !Ref IdempotencyTable
+    Export: { Name: !Sub "${Env}-orders-idempotency-table" }
