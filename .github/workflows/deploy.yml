@@ -1,0 +1,71 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sis3/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: orders-api-dev
+  STACK_NAME: orders-app-dev
+  ENV_NAME: dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production   # the role trusts only this environment
+    defaults:
+      run:
+        working-directory: sis3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test - lint templates and compile the app
+        run: |
+          pip install cfn-lint
+          cfn-lint --non-zero-exit-code error infra/00-github-oidc.yaml infra/01-foundation.yaml infra/02-app.yaml
+          python -m py_compile app/app.py
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build and push the image tagged with the commit SHA
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+          aws ecr get-login-password | docker login --username AWS --password-stdin $REGISTRY
+          if aws ecr describe-images --repository-name $ECR_REPO --image-ids imageTag=$GITHUB_SHA > /dev/null 2>&1; then
+            echo "Image $GITHUB_SHA is already in ECR (immutable tags) - skipping push"
+          else
+            docker build --platform linux/amd64 -t $REGISTRY/$ECR_REPO:$GITHUB_SHA app
+            docker push $REGISTRY/$ECR_REPO:$GITHUB_SHA
+          fi
+
+      - name: Deploy the app stack with the new image tag
+        run: |
+          aws cloudformation deploy \
+            --stack-name $STACK_NAME \
+            --template-file infra/02-app.yaml \
+            --parameter-overrides Env=$ENV_NAME ImageTag=$GITHUB_SHA \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Smoke test - the load balancer must answer on /health
+        run: |
+          ALB=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" --output text)
+          for i in $(seq 1 12); do
+            if curl -fs http://$ALB/health; then echo; echo "health check passed"; exit 0; fi
+            echo "not ready yet, retrying..."; sleep 10
+          done
+          echo "health check failed"; exit 1

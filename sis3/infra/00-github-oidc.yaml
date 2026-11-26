@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Practice 7 - lets GitHub Actions deploy the orders-app stack WITHOUT stored access keys.
+  Creates the GitHub OIDC identity provider (once per account) and one deploy role whose
+  trust policy accepts only this repository's "production" GitHub Environment.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub user or organisation name (e.g. m-zhenis)
+  GitHubRepo:
+    Type: String
+    Description: Repository name (e.g. Cloud-Application-Development)
+  GitHubOwnerId:
+    Type: String
+    Description: Numeric ID of the owner (immutable subject format, repos created after 15 July 2026)
+  GitHubRepoId:
+    Type: String
+    Description: Numeric ID of the repository
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: GitHub Environment the job runs in; the role trusts only this one
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Set to false if this account already has the GitHub OIDC provider
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: Only used when CreateOidcProvider is false
+
+Conditions:
+  CreateProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+
+  # One per AWS account. AWS no longer needs a certificate thumbprint for GitHub.
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  # Trust policy answers "WHICH workflow may become this role?"
+  # Permission policy (below) answers "WHAT may it do?"
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "gha-deploy-${EnvironmentName}"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !If
+                - CreateProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingOidcProviderArn
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  # classic format (older repositories)
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:environment:${EnvironmentName}"
+                  # immutable format (repositories created after 15 July 2026)
+                  - !Sub "repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:environment:${EnvironmentName}"
+      Policies:
+        - PolicyName: deploy-orders-app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Services the orders-app stack and the image push need.
+              # Resource "*" is a trade-off for a course project: it keeps the role short,
+              # but a real project would restrict these further.
+              - Sid: ServicesUsedByTheStack
+                Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - ec2:*
+                  - elasticloadbalancing:*
+                  - ecs:*
+                  - ecr:*
+                  - logs:*
+                Resource: "*"
+              # The app stack creates two IAM roles. Allow ONLY roles named orders-*-role-*.
+              - Sid: ManageOnlyOrdersRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/orders-*-role-*"
+              # PassRole: the classic cause of AccessDenied after "Assuming role ... success".
+              - Sid: PassOnlyToEcsTasks
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/orders-*-role-*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - ecs.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+
+Outputs:
+  DeployRoleArn:
+    Description: Put this in the GitHub repository variable DEPLOY_ROLE_ARN
+    Value: !GetAtt DeployRole.Arn
