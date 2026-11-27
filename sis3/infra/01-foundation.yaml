@@ -10,6 +10,13 @@ Parameters:
     AllowedValues: [dev, staging, prod]
     Default: dev
     Description: Environment name. Used to namespace resources and exports.
+  AlertEmail:
+    Type: String
+    Description: Email that receives alarm notifications and budget alerts (Practice 8).
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
+    Description: Monthly cost budget in USD; alerts at 50 percent and 100 percent.
 
 Resources:
 
@@ -36,6 +43,7 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub "order-events-${Env}"
+      TracingConfig: Active   # Practice 8: SNS adds itself to the X-Ray trace and passes the trace header on
 
   OrdersQueueSubscription:
     Type: AWS::SNS::Subscription
@@ -121,6 +129,10 @@ Resources:
                 Effect: Allow
                 Action: [dynamodb:PutItem, dynamodb:GetItem]
                 Resource: !GetAtt IdempotencyTable.Arn
+              - Sid: XRayTracing
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"   # X-Ray write actions do not support resource-level permissions
 
   ConsumerFunction:
     Type: AWS::Lambda::Function
@@ -131,9 +143,12 @@ Resources:
       Handler: index.handler
       Timeout: 10
       Role: !GetAtt ConsumerFunctionRole.Arn
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
           TABLE_NAME: !Ref IdempotencyTable
+          ENV_NAME: !Ref Env
       Code:
         ZipFile: |
           import json, os, time
@@ -142,6 +157,24 @@ Resources:
 
           dynamodb = boto3.resource("dynamodb")
           table = dynamodb.Table(os.environ["TABLE_NAME"])
+          ENV = os.environ.get("ENV_NAME", "dev")
+
+          def log(event, metric=None, **fields):
+              # One JSON object per line = structured log (queryable in Logs Insights).
+              # If "metric" is given, the line is also in CloudWatch Embedded Metric Format (EMF):
+              # CloudWatch turns it into a custom metric OrdersApp/<metric> with dimension Env.
+              line = {"event": event, "Env": ENV, **fields}
+              if metric:
+                  line[metric] = 1
+                  line["_aws"] = {
+                      "Timestamp": int(time.time() * 1000),
+                      "CloudWatchMetrics": [{
+                          "Namespace": "OrdersApp",
+                          "Dimensions": [["Env"]],
+                          "Metrics": [{"Name": metric, "Unit": "Count"}],
+                      }],
+                  }
+              print(json.dumps(line))
 
           def handler(event, context):
               for record in event["Records"]:
@@ -159,10 +192,10 @@ Resources:
                       )
                   except ClientError as e:
                       if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                          print(f"DUPLICATE skipped, dedup_key={dedup_key}")
+                          log("DUPLICATE", metric="DuplicatesSkipped", dedup_key=dedup_key)
                           continue
                       raise
-                  print(f"PROCESSED order, dedup_key={dedup_key}, body={body}")
+                  log("PROCESSED", metric="OrdersProcessed", dedup_key=dedup_key)
               return {"batchItemFailures": []}
 
   ConsumerEventSourceMapping:
@@ -173,11 +206,113 @@ Resources:
       BatchSize: 5
       FunctionResponseTypes: [ReportBatchItemFailures]
 
+  # ---------- Observability and cost (week 13, Practice 8) ----------
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "orders-alarms-${Env}"
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail   # stays "Pending confirmation" until the link in the email is clicked
+
+  # Alarm on a SYMPTOM that matters: any message in the dead-letter queue means an order failed 5 times.
+  DlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "orders-dlq-not-empty-${Env}"
+      AlarmDescription: A message landed in the dead-letter queue - an order failed all 5 attempts.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrdersDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # Saved Logs Insights query: Lambda latency (p95) over time.
+  ConsumerLatencyQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "orders-consumer-p95-latency-${Env}"
+      LogGroupNames: [!Ref ConsumerLogGroup]
+      QueryString: |
+        filter @type = "REPORT"
+        | stats avg(@duration) as avg_ms, pct(@duration, 95) as p95_ms, max(@duration) as max_ms, count(*) as invocations by bin(5m) as t
+        | sort t desc
+
+  OrdersDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "orders-${Env}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "alarm", "x": 0, "y": 0, "width": 24, "height": 3,
+              "properties": { "title": "Alarm status", "alarms": ["${DlqDepthAlarm.Arn}"] } },
+            { "type": "metric", "x": 0, "y": 3, "width": 12, "height": 6,
+              "properties": { "title": "Traffic: orders processed and consumer invocations", "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [ ["OrdersApp", "OrdersProcessed", "Env", "${Env}"],
+                             ["AWS/Lambda", "Invocations", "FunctionName", "${ConsumerFunction}"] ] } },
+            { "type": "metric", "x": 12, "y": 3, "width": 12, "height": 6,
+              "properties": { "title": "Errors: Lambda errors, duplicates skipped, DLQ depth", "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [ ["AWS/Lambda", "Errors", "FunctionName", "${ConsumerFunction}"],
+                             ["OrdersApp", "DuplicatesSkipped", "Env", "${Env}"],
+                             ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${OrdersDLQ.QueueName}"] ] } },
+            { "type": "metric", "x": 0, "y": 9, "width": 12, "height": 6,
+              "properties": { "title": "Latency: consumer duration p95 (ms)", "region": "${AWS::Region}", "stat": "p95", "period": 60, "view": "timeSeries",
+                "metrics": [ ["AWS/Lambda", "Duration", "FunctionName", "${ConsumerFunction}"] ] } },
+            { "type": "metric", "x": 12, "y": 9, "width": 12, "height": 6,
+              "properties": { "title": "Saturation: queue backlog and age of oldest message", "region": "${AWS::Region}", "stat": "Maximum", "period": 60, "view": "timeSeries",
+                "metrics": [ ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${OrdersQueue.QueueName}"],
+                             ["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${OrdersQueue.QueueName}"] ] } }
+          ]
+        }
+
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "orders-monthly-${Env}-${AWS::StackName}"   # the stack name is in the budget name, as the lecture advises
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
   # ---------- Container registry (week 10) ----------
 
   OrdersRepo:
     Type: AWS::ECR::Repository
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       RepositoryName: !Sub "orders-api-${Env}"
       ImageTagMutability: IMMUTABLE
@@ -219,3 +354,9 @@ Outputs:
   IdempotencyTableName:
     Value: !Ref IdempotencyTable
     Export: { Name: !Sub "${Env}-orders-idempotency-table" }
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+  DlqUrl:
+    Value: !Ref OrdersDLQ
+  DashboardName:
+    Value: !Ref OrdersDashboard

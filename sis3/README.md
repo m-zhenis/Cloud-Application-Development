@@ -95,3 +95,152 @@ gone (`aws ecr delete-repository --force`, `aws dynamodb delete-table`).
 
 Declare per course policy: infrastructure template and guidance drafted with
 AI assistance (Claude), reviewed, deployed and tested by the author.
+
+## Practice 8 - Observability
+
+- Custom metric (EMF): namespace `OrdersApp`, metrics `OrdersProcessed` and `DuplicatesSkipped`, dimension `Env`.
+- Alarm `orders-dlq-not-empty-dev` on DLQ depth (>= 1), notifies SNS topic `orders-alarms-dev`, email subscription Confirmed.
+- Tracing: active X-Ray tracing on SNS and Lambda (trace map: Client -> Lambda Context -> Lambda Function).
+- Budget: monthly, alerts at 50% and 100%.
+
+Saved Logs Insights query `orders-consumer-p95-latency-dev`:
+
+```
+filter @type = "REPORT"
+| stats avg(@duration) as avg_ms, pct(@duration, 95) as p95_ms, max(@duration) as max_ms, count(*) as invocations by bin(5m) as t
+| sort t desc
+```
+
+Dashboard JSON (sis3/dashboard-orders-dev.json):
+
+```json
+{
+    "widgets": [
+        {
+            "type": "alarm",
+            "x": 0,
+            "y": 0,
+            "width": 24,
+            "height": 3,
+            "properties": {
+                "title": "Alarm status",
+                "alarms": [
+                    "arn:aws:cloudwatch:us-east-1:409289617759:alarm:orders-dlq-not-empty-dev"
+                ]
+            }
+        },
+        {
+            "type": "metric",
+            "x": 0,
+            "y": 3,
+            "width": 12,
+            "height": 6,
+            "properties": {
+                "title": "Traffic: orders processed and consumer invocations",
+                "region": "us-east-1",
+                "stat": "Sum",
+                "period": 60,
+                "view": "timeSeries",
+                "metrics": [
+                    [
+                        "OrdersApp",
+                        "OrdersProcessed",
+                        "Env",
+                        "dev"
+                    ],
+                    [
+                        "AWS/Lambda",
+                        "Invocations",
+                        "FunctionName",
+                        "orders-consumer-dev"
+                    ]
+                ]
+            }
+        },
+        {
+            "type": "metric",
+            "x": 12,
+            "y": 3,
+            "width": 12,
+            "height": 6,
+            "properties": {
+                "title": "Errors: Lambda errors, duplicates skipped, DLQ depth",
+                "region": "us-east-1",
+                "stat": "Sum",
+                "period": 60,
+                "view": "timeSeries",
+                "metrics": [
+                    [
+                        "AWS/Lambda",
+                        "Errors",
+                        "FunctionName",
+                        "orders-consumer-dev"
+                    ],
+                    [
+                        "OrdersApp",
+                        "DuplicatesSkipped",
+                        "Env",
+                        "dev"
+                    ],
+                    [
+                        "AWS/SQS",
+                        "ApproximateNumberOfMessagesVisible",
+                        "QueueName",
+                        "orders-dlq-dev"
+                    ]
+                ]
+            }
+        },
+        {
+            "type": "metric",
+            "x": 0,
+            "y": 9,
+            "width": 12,
+            "height": 6,
+            "properties": {
+                "title": "Latency: consumer duration p95 (ms)",
+                "region": "us-east-1",
+                "stat": "p95",
+                "period": 60,
+                "view": "timeSeries",
+                "metrics": [
+                    [
+                        "AWS/Lambda",
+                        "Duration",
+                        "FunctionName",
+                        "orders-consumer-dev"
+                    ]
+                ]
+            }
+        },
+        {
+            "type": "metric",
+            "x": 12,
+            "y": 9,
+            "width": 12,
+            "height": 6,
+            "properties": {
+                "title": "Saturation: queue backlog and age of oldest message",
+                "region": "us-east-1",
+                "stat": "Maximum",
+                "period": 60,
+                "view": "timeSeries",
+                "metrics": [
+                    [
+                        "AWS/SQS",
+                        "ApproximateNumberOfMessagesVisible",
+                        "QueueName",
+                        "orders-queue-dev"
+                    ],
+                    [
+                        "AWS/SQS",
+                        "ApproximateAgeOfOldestMessage",
+                        "QueueName",
+                        "orders-queue-dev"
+                    ]
+                ]
+            }
+        }
+    ]
+}
+```
